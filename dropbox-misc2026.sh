@@ -130,8 +130,11 @@ ensure_linked() {
   done
   rm -f /tmp/.dbx-link-opened
   linked || die "cuenta no enlazada tras 10 min; ejecuta la URL de vinculación"
-  # Snapshot de credenciales válidas para futuros rollbacks.
-  cp -a "$HOME/.dropbox" "$BACKUP_DIR/.dropbox-postlink" 2>/dev/null || true
+  # Refresca las credenciales más recientes para futuras reinstalaciones.
+  rm -rf "$STATE_DIR/creds.tmp"
+  cp -a "$HOME/.dropbox" "$STATE_DIR/creds.tmp" 2>/dev/null || true
+  rm -rf "$STATE_DIR/creds"
+  mv "$STATE_DIR/creds.tmp" "$STATE_DIR/creds" 2>/dev/null || true
 }
 
 # --- fases ----------------------------------------------------------------
@@ -145,6 +148,13 @@ phase_backup() {
   manifest_put "date=$(date -Is)"
 
   stop_daemon
+
+  # Credenciales vivas previas: preferibles al backup porque host.db rota
+  # en cada arranque y las copias antiguas quedan revocadas.
+  if linked; then
+    run rm -rf "$STATE_DIR/creds"
+    run cp -a "$HOME/.dropbox" "$STATE_DIR/creds"
+  fi
 
   for src in "$HOME/.dropbox" "$HOME/.dropbox-dist" "$DROPBOX_DIR"; do
     [[ -e $src ]] || continue
@@ -197,7 +207,11 @@ phase_install() {
   fi
 
   log "Restaurando enlace de cuenta (~/.dropbox)"
-  run cp -a "$BACKUP_DIR/.dropbox" "$HOME/.dropbox"
+  if [[ -d $STATE_DIR/creds ]]; then
+    run cp -a "$STATE_DIR/creds" "$HOME/.dropbox"
+  else
+    run cp -a "$BACKUP_DIR/.dropbox" "$HOME/.dropbox"
+  fi
   run dropbox start
   if [[ $MODE == "dry-run" ]]; then return; fi
   wait_for_daemon || die "el daemon no arrancó en ${DAEMON_WAIT_S}s"
@@ -341,14 +355,17 @@ do_rollback() {
   # Solo repone credenciales si el enlace actual está roto: restaurar un
   # .dropbox antiguo revoca la sesión (Dropbox rota host.db al arrancar).
   if ! linked; then
-    rm -rf "$HOME/.dropbox" "$HOME/.dropbox-dist"
-    if [[ -d $b/.dropbox-postlink ]]; then
+    rm -rf "$HOME/.dropbox"
+    if [[ -d $STATE_DIR/creds ]]; then
+      cp -a "$STATE_DIR/creds" "$HOME/.dropbox"
+    elif [[ -d $b/.dropbox-postlink ]]; then
       cp -a "$b/.dropbox-postlink" "$HOME/.dropbox"
     else
       cp -a "$b/.dropbox" "$HOME/.dropbox" 2>/dev/null || warn "sin backup de .dropbox"
     fi
-    cp -a "$b/.dropbox-dist" "$HOME/.dropbox-dist" 2>/dev/null || warn "sin backup de .dropbox-dist"
   fi
+  [[ -d $HOME/.dropbox-dist ]] || \
+    cp -a "$b/.dropbox-dist" "$HOME/.dropbox-dist" 2>/dev/null || warn "sin backup de .dropbox-dist"
   [[ -f $b/autostart-dropbox.desktop ]] && \
     cp -a "$b/autostart-dropbox.desktop" "$HOME/.config/autostart/dropbox.desktop"
 
