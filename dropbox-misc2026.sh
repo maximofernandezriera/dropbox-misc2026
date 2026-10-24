@@ -108,6 +108,32 @@ wait_for_cli() {
   return 0
 }
 
+linked() { [[ -f $HOME/.dropbox/info.json ]]; }
+
+# Si el daemon queda sin enlazar (credenciales restauradas rotadas), abre la
+# URL de vinculación en el navegador y espera a que el enlace se complete.
+ensure_linked() {
+  linked && return 0
+  local waited=0 st url
+  while (( waited < 600 )); do
+    linked && { ok "Cuenta enlazada"; break; }
+    st=$(dropbox_cli status)
+    url=$(grep -o 'https://[^ ]*cli_link_nonce[^ ]*' <<< "$st" | head -1)
+    if [[ -n $url && ! -f /tmp/.dbx-link-opened ]]; then
+      warn "Dropbox necesita vincular la cuenta: abre el navegador y confirma"
+      warn "$url"
+      xdg-open "$url" >/dev/null 2>&1 || true
+      notify "Confirma la vinculación de Dropbox en el navegador"
+      touch /tmp/.dbx-link-opened
+    fi
+    sleep 10; (( waited += 10 ))
+  done
+  rm -f /tmp/.dbx-link-opened
+  linked || die "cuenta no enlazada tras 10 min; ejecuta la URL de vinculación"
+  # Snapshot de credenciales válidas para futuros rollbacks.
+  cp -a "$HOME/.dropbox" "$BACKUP_DIR/.dropbox-postlink" 2>/dev/null || true
+}
+
 # --- fases ----------------------------------------------------------------
 
 phase_backup() {
@@ -177,6 +203,8 @@ phase_install() {
   wait_for_daemon || die "el daemon no arrancó en ${DAEMON_WAIT_S}s"
   wait_for_cli || die "el CLI no responde en ${DAEMON_WAIT_S}s"
   ok "Daemon activo: $(dropbox_cli status | head -1)"
+
+  ensure_linked
 }
 
 phase_selective_sync() {
@@ -310,9 +338,17 @@ do_rollback() {
   dpkg -s "$DROPBOX_PKG" >/dev/null 2>&1 || \
     as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$DROPBOX_PKG"
 
-  rm -rf "$HOME/.dropbox" "$HOME/.dropbox-dist"
-  cp -a "$b/.dropbox" "$HOME/.dropbox" 2>/dev/null || warn "sin backup de .dropbox"
-  cp -a "$b/.dropbox-dist" "$HOME/.dropbox-dist" 2>/dev/null || warn "sin backup de .dropbox-dist"
+  # Solo repone credenciales si el enlace actual está roto: restaurar un
+  # .dropbox antiguo revoca la sesión (Dropbox rota host.db al arrancar).
+  if ! linked; then
+    rm -rf "$HOME/.dropbox" "$HOME/.dropbox-dist"
+    if [[ -d $b/.dropbox-postlink ]]; then
+      cp -a "$b/.dropbox-postlink" "$HOME/.dropbox"
+    else
+      cp -a "$b/.dropbox" "$HOME/.dropbox" 2>/dev/null || warn "sin backup de .dropbox"
+    fi
+    cp -a "$b/.dropbox-dist" "$HOME/.dropbox-dist" 2>/dev/null || warn "sin backup de .dropbox-dist"
+  fi
   [[ -f $b/autostart-dropbox.desktop ]] && \
     cp -a "$b/autostart-dropbox.desktop" "$HOME/.config/autostart/dropbox.desktop"
 
@@ -324,9 +360,10 @@ do_rollback() {
   fi
   grep -q '^git:' "$b/manifest.txt" || rm -rf "$DROPBOX_DIR/$KEEP_FOLDER/.git"
 
-  dropbox start
+  daemon_running || dropbox start
   wait_for_daemon || die "daemon no arrancó en rollback"
   wait_for_cli || true
+  ensure_linked
 
   # Quita todas las exclusiones para resincronizar la cuenta completa.
   local ex
