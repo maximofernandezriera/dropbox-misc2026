@@ -28,9 +28,11 @@ ENUM_WAIT_S=600
 SETTLE_WAIT_S=900
 
 MODE="install"
+USE_BACKUP=""
 [[ "${1:-}" == "--rollback" ]] && MODE="rollback"
 [[ "${1:-}" == "--status" ]] && MODE="status"
 [[ "${1:-}" == "--dry-run" ]] && MODE="dry-run"
+[[ "${1:-}" == "--use-backup" ]] && USE_BACKUP="${2:-}"
 
 mkdir -p "$BACKUP_ROOT" "$LOG_DIR"
 LOG_FILE="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-$MODE.log"
@@ -67,6 +69,12 @@ manifest_put() {
 }
 
 daemon_running() { pgrep -f "$HOME/.dropbox-dist/.*/dropbox" >/dev/null 2>&1; }
+
+wipe_dir() {
+  [[ -e $1 ]] || return 0
+  chmod -R u+w "$1" 2>/dev/null || true
+  rm -rf "$1"
+}
 
 stop_daemon() {
   daemon_running || return 0
@@ -142,7 +150,9 @@ phase_uninstall() {
   for ext in $(ls "$HOME/.local/share/gnome-shell/extensions" 2>/dev/null | grep -i dropbox || true); do
     run gnome-extensions uninstall "$ext"
   done
-  run rm -rf "$HOME/.dropbox" "$HOME/.dropbox-dist" "$DROPBOX_DIR"
+  run wipe_dir "$HOME/.dropbox"
+  run wipe_dir "$HOME/.dropbox-dist"
+  run wipe_dir "$DROPBOX_DIR"
   rm -f "$HOME/.config/autostart/dropbox.desktop" 2>/dev/null || true
   ok "Dropbox desinstalado"
 }
@@ -321,9 +331,16 @@ case $MODE in
   rollback)
     do_rollback; phase_verify || true; exit 0 ;;
   install|dry-run)
-    [[ $MODE == "dry-run" ]] && BACKUP_DIR="$BACKUP_ROOT/dry-run" && MANIFEST=/dev/null
     notify "Iniciando reinstalación selectiva"
-    phase_backup
+    if [[ -n $USE_BACKUP ]]; then
+      BACKUP_DIR="$(readlink -f "$USE_BACKUP")"
+      MANIFEST="$BACKUP_DIR/manifest.txt"
+      [[ -f $MANIFEST ]] || die "backup inválido: $USE_BACKUP"
+      log "Reanudando con backup existente: $BACKUP_DIR"
+    else
+      [[ $MODE == "dry-run" ]] && BACKUP_DIR="$BACKUP_ROOT/dry-run" && MANIFEST=/dev/null
+      phase_backup
+    fi
     phase_uninstall
     phase_install
     phase_selective_sync
