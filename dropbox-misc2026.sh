@@ -184,36 +184,41 @@ phase_selective_sync() {
   [[ $MODE == "dry-run" ]] && { log "DRY  excluiría todo excepto $KEEP_FOLDER"; return; }
 
   declare -A excluded=()
-  local known stable=0 waited=0
-  mapfile -t known < <(grep '^top:' "$MANIFEST" | cut -d: -f2-)
+  local current left st waited=0 stable=0
+  local known_count
+  known_count=$(grep -c '^top:' "$MANIFEST" || true)
+  (( known_count > 0 )) && (( known_count -= 1 ))  # menos misc2026
 
-  # Exclusión inmediata de todas las carpetas conocidas: el CLI no exige que
-  # el directorio exista localmente, así el daemon no descarga nada de ellas.
-  local -a abs=()
-  for d in "${known[@]}"; do
-    [[ $d == "$KEEP_FOLDER" ]] && continue
-    abs+=("$DROPBOX_DIR/$d"); excluded[$d]=1
-  done
-  (( ${#abs[@]} > 0 )) && dropbox_cli exclude add "${abs[@]}" >/dev/null
-  log "Excluidas de entrada: ${#excluded[@]} carpetas conocidas"
-
-  # Vigila nuevas carpetas de primer nivel creadas en la nube desde el backup.
+  # El daemon exige que la carpeta exista localmente para aceptar la exclusión,
+  # así que primero espera a que termine la indexación inicial.
   while (( waited < ENUM_WAIT_S )); do
-    local current newfound=0
+    st=$(dropbox_cli status | head -1)
+    grep -qiE "índice|index|starting|iniciando|conectando" <<< "$st" || break
+    sleep 10; (( waited += 10 ))
+  done
+  log "Indexación terminada (${waited}s): $st"
+
+  waited=0
+  while (( waited < ENUM_WAIT_S )); do
     mapfile -t current < <(ls -1A "$DROPBOX_DIR" 2>/dev/null | grep -v '^\.' || true)
     for d in "${current[@]}"; do
       [[ $d == "$KEEP_FOLDER" || -n ${excluded[$d]:-} ]] && continue
       [[ -d "$DROPBOX_DIR/$d" ]] || continue
-      dropbox_cli exclude add "$DROPBOX_DIR/$d" >/dev/null
-      excluded[$d]=1; newfound=1
-      log "Excluida: $d"
+      if dropbox_cli exclude add "$DROPBOX_DIR/$d" | grep -q "Excluded"; then
+        excluded[$d]=1
+        log "Excluida: $d"
+      else
+        warn "no se pudo excluir: $d"
+      fi
     done
-    if (( newfound == 0 )); then (( stable += 1 )); else stable=0; fi
-    (( stable >= 4 )) && break
-    sleep 15; (( waited += 15 ))
+    left=$(ls -1A "$DROPBOX_DIR" 2>/dev/null | grep -v '^\.' | grep -vx "$KEEP_FOLDER" || true)
+    [[ -z $left && ${#excluded[@]} -ge $known_count ]] && break
+    if [[ -z $left ]]; then (( stable += 1 )); else stable=0; fi
+    (( stable >= 12 )) && break
+    sleep 10; (( waited += 10 ))
   done
   manifest_put "excluded=$(printf '%s|' "${!excluded[@]}")"
-  ok "Carpetas excluidas: ${#excluded[@]}"
+  ok "Carpetas excluidas: ${#excluded[@]} (tras ${waited}s)"
 
   log "Esperando a que $KEEP_FOLDER quede al día…"
   waited=0
@@ -272,10 +277,20 @@ phase_verify() {
   local fail=0
   daemon_running && ok "daemon activo" || { warn "daemon NO activo"; fail=1; }
   if [[ -d $DROPBOX_DIR ]]; then
-    local others
-    others=$(ls -1A "$DROPBOX_DIR" | grep -v '^\.' | grep -vx "$KEEP_FOLDER" || true)
-    if [[ -n $others ]]; then warn "quedan entradas locales: $(printf '%s ' $others)"; fail=1
+    local others nfiles=0 e
+    others=$(
+      while IFS= read -r e; do
+        [[ -d $DROPBOX_DIR/$e ]] && printf '%s\n' "$e"
+      done < <(ls -1A "$DROPBOX_DIR" | grep -v '^\.' | grep -vx "$KEEP_FOLDER" || true)
+    )
+    while IFS= read -r e; do
+      [[ -f $DROPBOX_DIR/$e ]] && (( nfiles += 1 ))
+    done < <(ls -1A "$DROPBOX_DIR" | grep -v '^\.' || true)
+    if [[ -n $others ]]; then warn "quedan carpetas locales: $(printf '%s ' $others)"; fail=1
     else ok "solo $KEEP_FOLDER está presente localmente"; fi
+    if (( nfiles > 0 )); then
+      log "INFO $nfiles archivos sueltos en la raíz (Dropbox no permite excluir archivos, solo carpetas)"
+    fi
   fi
   [[ -d "$DROPBOX_DIR/$KEEP_FOLDER/.git" ]] && ok "git repo presente" || { warn "sin repo git"; fail=1; }
   gnome-extensions list --enabled | grep -qx "$APPINDICATOR_UUID" \
